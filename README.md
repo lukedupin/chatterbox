@@ -1,3 +1,9 @@
+python 3.14
+
+pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/rocm7.1
+pip install librosa s3tokenizer transformers diffusers conformer safetensors numpy omegaconf pyloudnorm
+pip install chatterbox-tts --no-deps
+
 ![Chatterbox Turbo Image](./Chatterbox-Turbo.jpg)
 
 
