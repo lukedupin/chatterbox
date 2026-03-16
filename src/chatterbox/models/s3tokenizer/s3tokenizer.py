@@ -107,7 +107,8 @@ class S3Tokenizer(S3TokenizerV2):
         processed_wavs = self._prepare_audio(wavs)
         mels, mel_lens = [], []
         for wav in processed_wavs:
-            wav = wav.to(self.device)
+            wavf32 = wav.float()
+            wav = wavf32.to(self.device)
             mel = self.log_mel_spectrogram(wav)  # [B=1, F, T]
             if max_len is not None:
                 mel = mel[..., :max_len * 4]  # num_mel_frames = 4 * num_tokens
