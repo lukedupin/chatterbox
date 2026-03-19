@@ -44,6 +44,20 @@ def get_resampler(src_sr, dst_sr, device):
     return ta.transforms.Resample(src_sr, dst_sr).to(device)
 
 
+import time
+class TimerPref:
+    def __init__(self):
+        return
+        self.timer = time.perf_counter()
+
+    def __call__(self, name="", *args, **kwargs):
+        return
+        elapsed = (time.perf_counter() - self.timer) * 1000
+        print(f"TIMER: {name} Time elapsed: {elapsed:.2f}ms")
+        self.timer = time.perf_counter()
+
+
+
 class S3Token2Mel(torch.nn.Module):
     """
     S3Gen's CFM decoder maps S3 speech tokens to mel-spectrograms.
@@ -344,6 +358,8 @@ class S3Token2Wav(S3Token2Mel):
         # if drop_invalid_tokens:
         #     speech_tokens, speech_token_lens = drop_invalid(speech_tokens, pad=S3_QUIET_PAD)
 
+        timer = TimerPref()
+
         output_mels = self.flow_inference(
             speech_tokens,
             speech_token_lens=speech_token_lens,
@@ -353,10 +369,12 @@ class S3Token2Wav(S3Token2Mel):
             n_cfm_timesteps=n_cfm_timesteps,
             finalize=True,
         )
+        timer("flow_inference")
         output_mels = output_mels.to(dtype=self.dtype) # FIXME (fp16 mode) is this still needed?
         output_wavs, output_sources = self.hift_inference(output_mels, None)
 
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
         output_wavs[:, :len(self.trim_fade)] *= self.trim_fade
+        timer("hift_inference")
 
         return output_wavs, output_sources

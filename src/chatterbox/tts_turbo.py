@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox-turbo"
 
+import time
+class TimerPref:
+    def __init__(self):
+        return
+        self.timer = time.perf_counter()
+
+    def __call__(self, name="", *args, **kwargs):
+        return
+        elapsed = (time.perf_counter() - self.timer) * 1000
+        print(f"TIMER: {name} Time elapsed: {elapsed:.2f}ms")
+        self.timer = time.perf_counter()
+
 
 def punc_norm(text: str) -> str:
     """
@@ -119,6 +131,7 @@ class ChatterboxTurboTTS:
         tokenizer: EnTokenizer,
         device: str,
         conds: Conditionals = None,
+        device_s3=None,
     ):
         self.sr = S3GEN_SR  # sample rate of synthesized audio
         self.t3 = t3
@@ -126,6 +139,7 @@ class ChatterboxTurboTTS:
         self.ve = ve
         self.tokenizer = tokenizer
         self.device = device
+        self.device_s3 = device_s3
         self.conds = conds
         #self.watermarker = perth.PerthImplicitWatermarker()
 
@@ -138,6 +152,12 @@ class ChatterboxTurboTTS:
             map_location = torch.device('cpu')
         else:
             map_location = None
+
+        # Rocm HACK to avoid driver bug that 10x's compute time
+        device_s3 = device
+        if device in ["rocm", "amd"]:
+            device = 'cuda'
+            device_s3 = 'cpu'
 
         ve = VoiceEncoder()
         ve.load_state_dict(
@@ -167,7 +187,7 @@ class ChatterboxTurboTTS:
         s3gen.load_state_dict(
             weights, strict=True
         )
-        s3gen.to(device).eval()
+        s3gen.to(device_s3).eval()
 
         tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
         if tokenizer.pad_token is None:
@@ -180,7 +200,7 @@ class ChatterboxTurboTTS:
         if builtin_voice.exists():
             conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
+        return cls(t3, s3gen, ve, tokenizer, device, conds=conds, device_s3=device_s3)
 
     @classmethod
     def from_pretrained(cls, device) -> 'ChatterboxTurboTTS':
@@ -203,40 +223,49 @@ class ChatterboxTurboTTS:
 
     def norm_loudness(self, wav, sr, target_lufs=-27):
         try:
+            timer = TimerPref()
             meter = ln.Meter(sr)
             loudness = meter.integrated_loudness(wav)
             gain_db = target_lufs - loudness
             gain_linear = 10.0 ** (gain_db / 20.0)
             if math.isfinite(gain_linear) and gain_linear > 0.0:
                 wav = wav * gain_linear
+            timer()
         except Exception as e:
             print(f"Warning: Error in norm_loudness, skipping: {e}")
 
         return wav
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5, norm_loudness=True):
+        timer = TimerPref()
         ## Load and norm reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+        timer("librosa.load")
 
         assert len(s3gen_ref_wav) / _sr > 5.0, "Audio prompt must be longer than 5 seconds!"
 
         if norm_loudness:
             s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, _sr)
+            timer("norm_loudness")
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        timer("librosa.resample")
 
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
-        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+        s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device_s3)
+        timer("s3gen_ref_dict")
 
         # Speech cond prompt tokens
         if plen := self.t3.hp.speech_cond_prompt_len:
             s3_tokzr = self.s3gen.tokenizer
             t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
+            timer("t3_cond_prompt_tokens")
 
         # Voice-encoder speaker embedding
         ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+        timer("ve_embed")
 
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
@@ -244,6 +273,7 @@ class ChatterboxTurboTTS:
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        timer("conds")
 
     def generate(
         self,
@@ -258,8 +288,10 @@ class ChatterboxTurboTTS:
         top_k=1000,
         norm_loudness=True,
     ):
+        timer = TimerPref()
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+            timer(f"prepare_conditionals")
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
@@ -270,6 +302,7 @@ class ChatterboxTurboTTS:
         text = punc_norm(text)
         text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
         text_tokens = text_tokens.input_ids.to(self.device)
+        timer(f"text_tokens")
 
         speech_tokens = self.t3.inference_turbo(
             t3_cond=self.conds.t3,
@@ -279,19 +312,26 @@ class ChatterboxTurboTTS:
             top_p=top_p,
             repetition_penalty=repetition_penalty,
         )
+        timer("inference_turbo")
 
         # Remove OOV tokens and add silence to end
         speech_tokens = speech_tokens[speech_tokens < 6561]
-        speech_tokens = speech_tokens.to(self.device)
-        silence = torch.tensor([S3GEN_SIL, S3GEN_SIL, S3GEN_SIL]).long().to(self.device)
+        speech_tokens = speech_tokens.to(self.device_s3)
+        silence = torch.tensor([S3GEN_SIL, S3GEN_SIL, S3GEN_SIL]).long().to(self.device_s3)
         speech_tokens = torch.cat([speech_tokens, silence])
+        timer('Speech tokens split up')
 
         wav, _ = self.s3gen.inference(
             speech_tokens=speech_tokens,
             ref_dict=self.conds.gen,
             n_cfm_timesteps=2,
         )
+        timer("s3gen.inference")
         wav = wav.squeeze(0).detach().cpu().numpy()
         watermarked_wav = wav
         #watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        #return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+        xx = torch.from_numpy(watermarked_wav).unsqueeze(0)
+        timer(f"watermarked_wav")
+        return xx
